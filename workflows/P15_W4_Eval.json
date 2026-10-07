@@ -1,0 +1,341 @@
+{
+  "name": "Проект 15 — W4: Eval по расписанию, судья другого вендора (Базилик) · v2",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "w401",
+      "name": "0. Раз в сутки в 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -688,
+        304
+      ],
+      "notes": "Было 03:00, перенесено на 08:00 (решение Dennis 20.08): ночью Mac выключен, а весь локальный стек — Postgres, Qdrant, LM Studio — живёт на нём. Часовой пояс задан в самом воркфлоу (Europe/Berlin), поэтому пояс сервера your-n8n.example.com роли не играет."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id AS operation_id, intent, agent_used, user_message_masked, reply_masked FROM operation_log WHERE created_at >= now() - interval '24 hours' AND status = 'answered' AND NOT cache_hit AND coalesce(user_message_masked,'') <> '' AND coalesce(reply_masked,'') <> '' ORDER BY random() LIMIT 20;",
+        "options": {}
+      },
+      "id": "w402",
+      "name": "1. Postgres — выборка 20 диалогов",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -464,
+        304
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Вопрос гостя:\n{{ $json.user_message_masked }}\n\nОтвет ассистента:\n{{ $json.reply_masked }}\n\nОпределённый системой тип задачи: {{ $json.intent }}\nОтвечал агент: {{ $json.agent_used }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "Ты — эксперт по оценке качества AI-систем. Перед тобой пара «запрос гостя / ответ ассистента»\nресторана «Базилик». Оцени ответ по трём критериям, каждый по шкале 0–10.\n\nТОЧНОСТЬ (accuracy): факты ответа соответствуют вопросу и не противоречат сами себе.\nВыдуманные блюда, цены и правила — ноль. Особая строгость к аллергенам: утверждение\n«вам это можно есть» без опоры на карточку блюда — грубая ошибка.\n\nПОЛНОТА (completeness): гость получил то, что спрашивал, и то, что обязан был узнать.\nПри разговоре об аллергии обязательна просьба предупредить официанта при заказе.\nПри брони — подтверждение с номером и условиями. Лишние подробности полноту не повышают.\n\nТОН (tone): вежливо, на языке гостя, без обещаний, которых ресторан не давал,\nбез медицинских и юридических советов.\n\nОтдельно перечисли конкретные проблемы. «Ответ так себе» — не проблема; проблема —\n«назвал цену 19 € при 30 € в карточке».\n\nЕсли ответ представляет собой честную передачу вопроса администратору, это НЕ ошибка:\nоценивай, уместна ли была передача, а не сам факт."
+            }
+          ]
+        }
+      },
+      "id": "w403",
+      "name": "2. Судья — оценка ответа",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        -240,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"accuracy\": {\n      \"type\": \"integer\",\n      \"description\": \"0–10, фактическая точность\"\n    },\n    \"completeness\": {\n      \"type\": \"integer\",\n      \"description\": \"0–10, полнота ответа\"\n    },\n    \"tone\": {\n      \"type\": \"integer\",\n      \"description\": \"0–10, тон и уместность\"\n    },\n    \"issues\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      },\n      \"description\": \"конкретные проблемы, пустой массив если их нет\"\n    }\n  },\n  \"required\": [\n    \"accuracy\",\n    \"completeness\",\n    \"tone\",\n    \"issues\"\n  ]\n}"
+      },
+      "id": "w405",
+      "name": "Парсер — судья",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        -128,
+        544
+      ],
+      "notes": "Auto-fix выключен осознанно (20.08): в режиме авто-починки парсер требует СВОЮ модель через вход Model и падает с A Model sub-node must be connected and enabled ещё до вызова судьи (прогоны 2001–2011)."
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Судья вернул оценки — приводим каждую к форме строки eval_log и подшиваем к своему диалогу.\n//\n// 🔴 Прогон 2013: узел брал $input.first() и писал в журнал ОДНУ оценку из 16.\n// Судья честно отработал все 16 диалогов за 10 минут, а в eval_log ушла бы первая строка —\n// и метрики качества считались бы по одному диалогу. Порядок элементов цепь LLM сохраняет,\n// поэтому i-я оценка относится к i-му диалогу.\nconst src = $('1. Postgres — выборка 20 диалогов').all();\nconst clamp = (x) => Math.max(0, Math.min(10, Math.round(Number(x) || 0)));\n\nreturn $input.all().map((it, i) => {\n  const s = (src[i] || src[0]).json;\n  const v = it.json.output || it.json;\n  return { json: {\n    operation_id: s.operation_id,\n    input: s.user_message_masked,\n    output: s.reply_masked,\n    intent_predicted: s.intent,\n    accuracy: clamp(v.accuracy),\n    completeness: clamp(v.completeness),\n    tone: clamp(v.tone),\n    issues: Array.isArray(v.issues) ? v.issues.join('; ') : (v.issues || null),\n    // Фиксируем модель судьи прямо в журнале: доказательство, что оценивал не тот,\n    // кто отвечал. Урок Модуля 13.\n    judge_model: 'meta/muse-glimmer (локально)',\n  } };\n});\n"
+      },
+      "id": "w406",
+      "name": "3. Привести оценку к строке журнала",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -16,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO eval_log (operation_id, input, output, intent_predicted, accuracy, completeness, tone, issues, judge_model) VALUES ($1::uuid, $2, $3, $4, $5::int, $6::int, $7::int, $8, $9);",
+        "options": {
+          "queryReplacement": "={{ [ $json.operation_id, $json.input, $json.output, $json.intent_predicted, $json.accuracy, $json.completeness, $json.tone, $json.issues, $json.judge_model ] }}"
+        }
+      },
+      "id": "w407",
+      "name": "4. Postgres — записать оценку",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        208,
+        304
+      ],
+      "credentials": {},
+      "notes": "🔴 Прогон 2013: параметры были строкой через запятую — n8n режет такую строку по запятым, и любая запятая внутри текста замечаний сдвигает все последующие значения. intent_predicted попадал в $5::int — отсюда invalid input syntax for type integer. Параметры всегда массивом."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH e AS (SELECT * FROM eval_log WHERE evaluated_at >= now() - interval '2 hours'), o AS (SELECT * FROM operation_log WHERE created_at >= now() - interval '24 hours') SELECT (SELECT count(*) FROM e) AS judged, (SELECT round(avg(accuracy)::numeric, 2) FROM e) AS avg_accuracy, (SELECT round(avg(completeness)::numeric, 2) FROM e) AS avg_completeness, (SELECT round(avg(tone)::numeric, 2) FROM e) AS avg_tone, (SELECT round(avg((accuracy + completeness + tone)/3.0)::numeric, 2) FROM e) AS avg_total, (SELECT count(*) FROM o) AS ops_24h, (SELECT round(100.0 * count(*) FILTER (WHERE status = 'escalated') / nullif(count(*), 0), 1) FROM o) AS escalation_pct, (SELECT round(100.0 * count(*) FILTER (WHERE cache_hit) / nullif(count(*), 0), 1) FROM o) AS cache_pct, (SELECT round(100.0 * count(*) FILTER (WHERE intent_predicted = intent_actual) / nullif(count(*) FILTER (WHERE intent_actual IS NOT NULL), 0), 1) FROM escalations) AS router_accuracy_pct, (SELECT count(*) FILTER (WHERE intent_actual IS NOT NULL) FROM escalations) AS router_sample, (SELECT value FROM restaurant_config WHERE key = 'operator_chat_id') AS operator_chat_id;",
+        "options": {}
+      },
+      "id": "w408",
+      "name": "5. Postgres — свести метрики",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        432,
+        304
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Пороги из брифа: средний балл ниже 7 или доля эскалаций выше 20 % — тревога.\n// Точность роутера считается по данным escalations: оператор при разборе проставляет\n// фактический интент, и метрика получается на реальных данных, а не на самооценке модели.\nconst m = $input.first().json || {};\nconst AVG_MIN = 7.0, ESC_MAX = 20.0, ROUTER_MIN = 85.0;\n\nconst problems = [];\nif (m.avg_total !== null && Number(m.avg_total) < AVG_MIN)\n  problems.push(`средний балл ${m.avg_total} ниже ${AVG_MIN}`);\nif (m.escalation_pct !== null && Number(m.escalation_pct) > ESC_MAX)\n  problems.push(`доля эскалаций ${m.escalation_pct} % выше ${ESC_MAX} %`);\nif (m.router_accuracy_pct !== null && Number(m.router_accuracy_pct) < ROUTER_MIN)\n  problems.push(`точность роутера ${m.router_accuracy_pct} % ниже ${ROUTER_MIN} %`);\n\nconst routerLine = Number(m.router_sample) > 0\n  ? `${m.router_accuracy_pct} % (по ${m.router_sample} разобранным эскалациям)`\n  : 'не измерена — оператор ещё не проставил ни одного фактического интента';\n\nconst text =\n  `🧪 *Eval за сутки*\\n\\n` +\n  `Оценено диалогов: ${m.judged || 0}\\n` +\n  `Точность: ${m.avg_accuracy ?? '—'} · полнота: ${m.avg_completeness ?? '—'} · тон: ${m.avg_tone ?? '—'}\\n` +\n  `Средний балл: *${m.avg_total ?? '—'}*\\n\\n` +\n  `Обращений за сутки: ${m.ops_24h || 0}\\n` +\n  `Эскалаций: ${m.escalation_pct ?? '—'} % · из кэша: ${m.cache_pct ?? '—'} %\\n` +\n  `Точность роутера: ${routerLine}\\n\\n` +\n  (problems.length ? `⚠️ *Требует внимания:*\\n— ${problems.join('\\n— ')}` : '✅ Пороги в норме.');\n\nreturn [{ json: { ...m, alert: problems.length > 0, problems, report_text: text } }];\n"
+      },
+      "id": "w409",
+      "name": "6. Решение по порогам",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.operator_chat_id }}",
+        "text": "=👔 ВЛАДЕЛЬЦУ / АДМИНИСТРАТОРУ · Eval\n────────────\n{{ $json.report_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "w410",
+      "name": "7. Telegram — отчёт и тревога",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        864,
+        304
+      ],
+      "credentials": {},
+      "notes": "🔴 $env в параметрах узла запрещён на инстансе (N8N_BLOCK_ENV_ACCESS_IN_NODE) — метка роли сделана постоянной, решение штаба 20.08."
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "meta/muse-glimmer"
+        },
+        "options": {
+          "maxTokens": 2000,
+          "temperature": 0
+        }
+      },
+      "id": "w412",
+      "name": "Судья ЛОКАЛЬНЫЙ — Muse Glimmer (LM Studio)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        -304,
+        544
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "content": "## W4 — Eval по расписанию (v2, чистый граф)\n\n**В системе два разных проверяющих, и путать их нельзя.**\n\n**Валидатор** внутри MAIN проверяет **каждый** ответ до отправки гостю и может его завернуть. Это вратарь.\n\n**Судья Eval** работает ночью по выборке из 20 диалогов и никого не заворачивает — он измеряет качество в динамике и считает точность роутера. Это аудитор.\n\n**Судья ЛОКАЛЬНЫЙ — решение штаба 20.08.** `meta/muse-glimmer`, 18 ГБ, другой вендор против Gemma у агентов — требование «судья ≠ модель агентов» выполнено.\n\n**Почему не облако.** Судья читает реальные диалоги гостей. Отправлять их наружу — это третья страна, отдельный обработчик и целый раздел в DPIA. Локальный судья не отправляет ничего.\n\n**Облачный судья — альтернатива, НЕ подключена.** Паспорт узла и порядок возврата за пять минут — в файле 10_Resources/M15_W4_Облачный-судья-резерв.md\n\n**Почему v2.** У первого графа в settings остались ключи от UI-импорта (binaryMode, timeSavedMode, callerPolicy, availableInMCP), и публичный API отбивал любую запись целиком: settings must NOT have additional properties. Этот граф создан через API и правится через API.",
+        "height": 420,
+        "width": 560
+      },
+      "id": "w411",
+      "name": "ЧТО ЭТО И ЧЕМ ОТЛИЧАЕТСЯ ОТ ВАЛИДАТОРА",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -704,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://YOUR_LOCAL_HOST:1234/v1/chat/completions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"model\":\"meta/muse-glimmer\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1,\"temperature\":0}",
+        "options": {
+          "timeout": 240000
+        }
+      },
+      "id": "ed0926a1-34fb-4cff-9f7d-13a975de7249",
+      "name": "0a. Разогрев судьи (LM Studio)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -576,
+        304
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Урок 20.08: модели в LM Studio выгружаются сами, и ночной Eval падал именно поэтому. Один дешёвый запрос в 3:00 заставляет LM Studio поднять meta/muse-glimmer до того, как его позовёт судья. Ошибка здесь не останавливает прогон: если модель уже в памяти, запрос просто вернётся за миллисекунды."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "1. Postgres — выборка 20 диалогов": {
+      "main": [
+        [
+          {
+            "node": "2. Судья — оценка ответа",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Судья — оценка ответа": {
+      "main": [
+        [
+          {
+            "node": "3. Привести оценку к строке журнала",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Парсер — судья": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "2. Судья — оценка ответа",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Судья ЛОКАЛЬНЫЙ — Muse Glimmer (LM Studio)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "2. Судья — оценка ответа",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Привести оценку к строке журнала": {
+      "main": [
+        [
+          {
+            "node": "4. Postgres — записать оценку",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. Postgres — записать оценку": {
+      "main": [
+        [
+          {
+            "node": "5. Postgres — свести метрики",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5. Postgres — свести метрики": {
+      "main": [
+        [
+          {
+            "node": "6. Решение по порогам",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "6. Решение по порогам": {
+      "main": [
+        [
+          {
+            "node": "7. Telegram — отчёт и тревога",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "0. Раз в сутки в 08:00": {
+      "main": [
+        [
+          {
+            "node": "0a. Разогрев судьи (LM Studio)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "0a. Разогрев судьи (LM Studio)": {
+      "main": [
+        [
+          {
+            "node": "1. Postgres — выборка 20 диалогов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "Europe/Berlin"
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "staticData": null
+}

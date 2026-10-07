@@ -1,0 +1,133 @@
+{
+  "name": "Проект 15 — W6: сводка броней администратору (Базилик)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 * * *"
+            }
+          ]
+        }
+      },
+      "id": "w601",
+      "name": "0. Каждый день в 10:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -464,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT count(*) AS total, coalesce(sum(party_size) FILTER (WHERE status <> 'cancelled'), 0) AS guests, count(*) FILTER (WHERE status = 'cancelled') AS cancelled, count(*) FILTER (WHERE prepay_required AND status <> 'cancelled') AS prepay_count, count(*) FILTER (WHERE status IN ('pending','reminded_2h','reminded_24h')) AS unconfirmed, coalesce(jsonb_agg(jsonb_build_object('ref', booking_ref, 'time', to_char(booking_time,'HH24:MI'), 'size', party_size, 'status', status, 'children', children_count, 'chair', child_chair, 'prepay', prepay_required) ORDER BY booking_time) FILTER (WHERE status <> 'cancelled'), '[]'::jsonb) AS list, (SELECT value FROM restaurant_config WHERE key = 'operator_chat_id') AS operator_chat_id FROM bookings WHERE booking_date = current_date;",
+        "options": {}
+      },
+      "id": "w602",
+      "name": "1. Postgres — брони на сегодня",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -240,
+        304
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Сводка администратору на день — требование кейса.\n// Модель не вызывается: это выборка из базы, а не текст, который надо сочинять.\nconst r = $input.first().json || {};\nconst list = r.list || [];\nconst d = new Date().toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' });\n\nconst RU = { pending: 'ждёт подтверждения', confirmed: 'подтверждена',\n             reminded_24h: 'напомнили за сутки', reminded_2h: 'напомнили за 2 ч',\n             visit_confirmed: 'гость подтвердил', completed: 'состоялась',\n             no_show: 'не пришёл' };\n\n// Метка роли постоянная (решение штаба 20.08): $env на этом инстансе запрещён,\n// а сводка и так уходит только администратору.\nlet text = '👔 ВЛАДЕЛЬЦУ / АДМИНИСТРАТОРУ · сводка дня\\n────────────\\n' +\n           `📋 *Брони на ${d}*\\n\\n`;\nif (list.length === 0) {\n  text += 'На сегодня броней нет.';\n} else {\n  text += `Всего: *${list.length}* · гостей: *${r.guests}*` +\n          (Number(r.cancelled) ? ` · отменено: ${r.cancelled}` : '') + '\\n';\n  if (Number(r.unconfirmed)) text += `⚠️ Не подтвердили визит: *${r.unconfirmed}*\\n`;\n  if (Number(r.prepay_count)) text += `💶 С предоплатой: ${r.prepay_count}\\n`;\n  text += '\\n';\n  for (const b of list) {\n    const flags = [];\n    if (b.children) flags.push(`дети: ${b.children}`);\n    if (b.chair) flags.push('детский стул');\n    if (b.prepay) flags.push('предоплата');\n    text += `*${b.time}* · ${b.size} чел. · ${b.ref} — ${RU[b.status] || b.status}` +\n            (flags.length ? ` _(${flags.join(', ')})_` : '') + '\\n';\n  }\n}\nreturn [{ json: { summary_text: text, bookings_today: list.length,\n                  operator_chat_id: r.operator_chat_id } }];\n"
+      },
+      "id": "w603",
+      "name": "2. Собрать сводку",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -16,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.operator_chat_id }}",
+        "text": "={{ $json.summary_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "w604",
+      "name": "3. Telegram — сводка администратору",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        208,
+        304
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "content": "## W6 — сводка броней на день\n\n**Прямое требование кейса:** «передавать администратору сводку броней на день».\n\nРаз в сутки в 10:00 администратор получает в Telegram список: время, число гостей, номер брони, статус, дети и предоплата. Отдельной строкой — сколько гостей ещё **не подтвердили визит**: это та самая доля неявок, ради которой всё затевалось.\n\n**Модель не вызывается.** Это выборка из базы и шаблон — ноль токенов.\n\nОтменённые брони в список не попадают, но их число показано в шапке.",
+        "height": 300,
+        "width": 480
+      },
+      "id": "w605",
+      "name": "ЗАЧЕМ ЭТОТ ВОРКФЛОУ",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -464,
+        -16
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "0. Каждый день в 10:00": {
+      "main": [
+        [
+          {
+            "node": "1. Postgres — брони на сегодня",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Postgres — брони на сегодня": {
+      "main": [
+        [
+          {
+            "node": "2. Собрать сводку",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Собрать сводку": {
+      "main": [
+        [
+          {
+            "node": "3. Telegram — сводка администратору",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "Europe/Berlin"
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "staticData": null
+}

@@ -1,0 +1,346 @@
+{
+  "name": "Проект 15 — W2: напоминания T−2 ч и контроль молчания (Базилик)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "w201",
+      "name": "0. Каждые 15 минут",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -464,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT b.booking_ref, b.channel, b.user_ref, b.party_size, b.booking_date, b.booking_time, (b.booking_date + b.booking_time) AS when_ts, (SELECT value FROM restaurant_config WHERE key = 'operator_chat_id') AS operator_chat_id FROM bookings b WHERE b.status IN ('pending','confirmed') AND b.reminded_2h_at IS NULL AND (b.booking_date + b.booking_time) BETWEEN now() + interval '105 minutes' AND now() + interval '135 minutes' ORDER BY when_ts;",
+        "options": {}
+      },
+      "id": "w202",
+      "name": "1. Postgres — кому пора напомнить",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -240,
+        304
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Текст напоминания и две кнопки. Никакой модели здесь нет и не нужно:\n// сообщение шаблонное, значит стоит ноль токенов.\n// Метки ролей больше не читаются из окружения (решение штаба 20.08).\n// Напоминание уходит гостю — ему служебная метка не нужна вовсе.\nconst out = [];\nfor (const item of $input.all()) {\n  const b = item.json;\n  const t = String(b.booking_time || '').slice(0, 5);\n  const d = new Date(b.booking_date).toLocaleDateString('ru-RU',\n            { day: 'numeric', month: 'long' });\n\n  // WhatsApp вне 24-часового окна требует утверждённого шаблона Meta, а он не подан.\n  // Поэтому напоминаем в Telegram, а по остальным каналам зовём администратора.\n  out.push({ json: { ...b,\n    can_message: b.channel === 'telegram',\n    reminder_text:\n      `Здравствуйте! Напоминаем о вашей брони в ресторане «Базилик».\\n\\n` +\n      `📅 ${d} в ${t}, ${b.party_size} чел.\\n` +\n      `Номер брони: ${b.booking_ref}\\n\\n` +\n      `Подтвердите, пожалуйста, что придёте — мы держим стол 15 минут от заявленного времени.`,\n    cb_confirm: `booking_confirm:${b.booking_ref}`,\n    cb_cancel:  `booking_cancel:${b.booking_ref}`,\n  }});\n}\nreturn out;\n"
+      },
+      "id": "w203",
+      "name": "2. Собрать напоминание",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -16,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "can-msg",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.can_message }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "w204",
+      "name": "3. IF можно написать гостю?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        208,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.user_ref }}",
+        "text": "={{ $json.reminder_text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Подтверждаю",
+                    "additionalFields": {
+                      "callback_data": "={{ $json.cb_confirm }}"
+                    }
+                  },
+                  {
+                    "text": "❌ Отменить",
+                    "additionalFields": {
+                      "callback_data": "={{ $json.cb_cancel }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "w205",
+      "name": "4a. Telegram — напоминание с кнопками",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        432,
+        208
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.operator_chat_id }}",
+        "text": "=🧑‍🍳 АДМИНИСТРАТОРУ\n────────────\n📞 *Напомнить вручную*\\n\\nКанал {{ $json.channel }} не позволяет писать первым без утверждённого шаблона.\\n\\nБронь {{ $json.booking_ref }}, {{ $json.party_size }} чел., {{ $json.booking_date }} {{ $json.booking_time }}.",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "w206",
+      "name": "4b. Telegram — администратору: напомнить вручную",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        432,
+        432
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE bookings SET reminded_2h_at = now(), status = 'reminded_2h', updated_at = now() WHERE booking_ref = $1 AND reminded_2h_at IS NULL;",
+        "options": {
+          "queryReplacement": "={{ $json.booking_ref }}"
+        }
+      },
+      "id": "w207",
+      "name": "5. Postgres — отметить, что напомнили",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        672,
+        304
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT b.booking_ref, b.channel, b.user_ref, b.party_size, b.booking_date, b.booking_time, (SELECT value FROM restaurant_config WHERE key = 'operator_chat_id') AS operator_chat_id FROM bookings b WHERE b.status = 'reminded_2h' AND b.reminded_2h_at < now() - interval '30 minutes' AND NOT EXISTS (SELECT 1 FROM escalations e WHERE e.booking_id = b.id AND e.reason = 'нет ответа на напоминание T−2 ч') ORDER BY b.booking_date, b.booking_time;",
+        "options": {}
+      },
+      "id": "w208",
+      "name": "6. Postgres — молчат больше 30 минут",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -240,
+        624
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.operator_chat_id }}",
+        "text": "=🧑‍🍳 АДМИНИСТРАТОРУ\n────────────\n⏰ *Гость не ответил на напоминание*\\n\\nБронь {{ $json.booking_ref }} · {{ $json.party_size }} чел. · {{ $json.booking_date }} {{ $json.booking_time }}\\n\\nМолчание НЕ считается подтверждением — свяжитесь с гостем лично.",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "w209",
+      "name": "7. Telegram — администратору: гость не ответил",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        112,
+        624
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (channel, user_ref, booking_id, intent_predicted, reason, summary) SELECT $1, $2, b.id, 'no_show_risk', 'нет ответа на напоминание T−2 ч', 'Бронь ' || b.booking_ref || ' на ' || b.booking_date || ' ' || b.booking_time || ', ' || b.party_size || ' чел. Гость не подтвердил визит после напоминания.' FROM bookings b WHERE b.booking_ref = $3 AND NOT EXISTS (SELECT 1 FROM escalations e WHERE e.booking_id = b.id AND e.reason = 'нет ответа на напоминание T−2 ч');",
+        "options": {
+          "queryReplacement": "={{ $json.channel }},={{ $json.user_ref }},={{ $json.booking_ref }}"
+        }
+      },
+      "id": "w210",
+      "name": "8. Postgres — записать эскалацию",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        352,
+        624
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "content": "## W2 — напоминания за 2 часа\n\n**Требование кейса:** «автоматически напоминать гостям за 2 часа до брони и просить подтвердить».\n\n**Правило AE-20: молчание ≠ подтверждение.** Гость, который не нажал кнопку в течение 30 минут, попадает не в «подтверждено», а к администратору. Это ровно та ошибка, из-за которой в кейсе 30 % броней не доезжают.\n\n**Модель здесь не вызывается ни разу** — текст шаблонный. Напоминание стоит ноль токенов.\n\n**Кнопку обрабатывает MAIN, а не этот воркфлоу.** У бота один вебхук на всю установку: если повесить Telegram-триггер сюда, он перехватит его у MAIN. Поэтому нажатие кнопки приходит в MAIN, в ветку `1b`.\n\n**WhatsApp:** писать первым вне 24-часового окна можно только утверждённым шаблоном Meta, а он не подан. Поэтому по WhatsApp напоминает администратор — честное ограничение, оно записано в документации.",
+        "height": 420,
+        "width": 540
+      },
+      "id": "w211",
+      "name": "ПОЧЕМУ ЭТОТ ВОРКФЛОУ ТАКОЙ",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -464,
+        -48
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "0. Каждые 15 минут": {
+      "main": [
+        [
+          {
+            "node": "1. Postgres — кому пора напомнить",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "6. Postgres — молчат больше 30 минут",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Postgres — кому пора напомнить": {
+      "main": [
+        [
+          {
+            "node": "2. Собрать напоминание",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Собрать напоминание": {
+      "main": [
+        [
+          {
+            "node": "3. IF можно написать гостю?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. IF можно написать гостю?": {
+      "main": [
+        [
+          {
+            "node": "4a. Telegram — напоминание с кнопками",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "4b. Telegram — администратору: напомнить вручную",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4a. Telegram — напоминание с кнопками": {
+      "main": [
+        [
+          {
+            "node": "5. Postgres — отметить, что напомнили",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4b. Telegram — администратору: напомнить вручную": {
+      "main": [
+        [
+          {
+            "node": "5. Postgres — отметить, что напомнили",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "6. Postgres — молчат больше 30 минут": {
+      "main": [
+        [
+          {
+            "node": "7. Telegram — администратору: гость не ответил",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7. Telegram — администратору: гость не ответил": {
+      "main": [
+        [
+          {
+            "node": "8. Postgres — записать эскалацию",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "Europe/Berlin"
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "staticData": null
+}

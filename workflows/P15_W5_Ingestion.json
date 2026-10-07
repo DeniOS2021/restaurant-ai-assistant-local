@@ -1,0 +1,298 @@
+{
+  "name": "Проект 15 — W5 Ingestion: Postgres → bge-m3 → Qdrant (Базилик)",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "0. Запуск вручную",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        1216,
+        432
+      ],
+      "id": "032b43a9-fa71-4030-a461-87c7d3f12925",
+      "notes": "Ingestion запускается осознанно, а не по расписанию: переиндексация базы знаний — операция, которую делает человек после изменения меню или политики."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, content, metadata FROM kb_chunks WHERE indexed_at IS NULL ORDER BY id;",
+        "options": {}
+      },
+      "name": "1. Postgres — забрать чанки",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1440,
+        432
+      ],
+      "id": "8d3d30fb-e945-4479-b14c-b41cbade9039",
+      "alwaysOutputData": true,
+      "credentials": {},
+      "notes": "Берём ВСЕ чанки: W5 делает полную переиндексацию. Причина — правило AE-29 (M9): одна модель эмбеддинга на коллекцию, смена модели = полная переиндексация. Частичная догрузка появится, когда база вырастет; на 41 чанке она только создаёт риск рассинхрона Postgres и Qdrant."
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Готовим документы к загрузке. Текст уже собран в kb_chunks (SQL-скрипт),\n// здесь только приводим форму и прокидываем kb_id в метаданные, чтобы найденный\n// фрагмент можно было проследить обратно до строки Postgres.\nconst out = [];\nfor (const item of $input.all()) {\n  const r = item.json;\n  const meta = typeof r.metadata === 'string' ? JSON.parse(r.metadata) : (r.metadata || {});\n  out.push({ json: {\n    kb_id: r.id,\n    text: r.content,\n    meta: { ...meta, kb_id: r.id }\n  }});\n}\nif (out.length === 0) {\n  throw new Error(\n    'Индексировать нечего: все чанки уже помечены как проиндексированные. ' +\n    'Это защита от дублей — повторный прогон W5 больше не заливает базу второй раз. ' +\n    'Если нужна ПЕРЕиндексация: пересоздайте коллекцию basilik_kb и выполните ' +\n    'update kb_chunks set indexed_at = null;'\n  );\n}\nreturn out;\n"
+      },
+      "name": "2. Подготовить документы",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1664,
+        432
+      ],
+      "id": "473752f7-290f-4b4a-911b-03675ce030be",
+      "notes": "Ожидается 41 документ: 30 карточек блюд + 11 разделов политики."
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "qdrantCollection": {
+          "__rl": true,
+          "mode": "id",
+          "value": "basilik_kb"
+        },
+        "options": {}
+      },
+      "name": "3. Qdrant — вставка",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreQdrant",
+      "typeVersion": 1.1,
+      "position": [
+        1904,
+        432
+      ],
+      "id": "5ddc4c32-7104-40e9-be45-a2de93ace85c",
+      "credentials": {},
+      "notes": "Вставка через штатную ноду — тем же способом, что и в M14. Так формат payload гарантированно совпадает с тем, что ожидает нода при поиске в MAIN: если писать напрямую в REST API, ключи payload надо угадывать.\nВАЖНО: коллекцию перед прогоном пересоздать (см. ноду-подсказку), иначе повторный запуск добавит вторую копию всех 41 точек и поиск начнёт возвращать дубли."
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-bge-m3",
+        "options": {
+          "encodingFormat": "float"
+        }
+      },
+      "name": "Embeddings — bge-m3 (LM Studio)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        1936,
+        640
+      ],
+      "id": "12cbf34d-d791-47a4-a7f4-017999209672",
+      "credentials": {},
+      "notes": "Локальная модель, размерность 1024 — совпадает с коллекцией basilik_kb. Та же модель обязана использоваться при поиске в MAIN."
+    },
+    {
+      "parameters": {
+        "jsonMode": "expressionData",
+        "jsonData": "={{ $json.text }}",
+        "options": {
+          "metadata": {
+            "metadataValues": [
+              {
+                "name": "source",
+                "value": "={{ $json.meta.source }}"
+              },
+              {
+                "name": "section",
+                "value": "={{ $json.meta.section || '' }}"
+              },
+              {
+                "name": "dish",
+                "value": "={{ $json.meta.dish || '' }}"
+              },
+              {
+                "name": "category",
+                "value": "={{ $json.meta.category || '' }}"
+              },
+              {
+                "name": "kb_id",
+                "value": "={{ $json.meta.kb_id }}"
+              }
+            ]
+          }
+        }
+      },
+      "name": "Загрузчик документов",
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        640
+      ],
+      "id": "a24efd81-c0de-4793-9630-164c4c656015",
+      "notes": "Чанкинг не применяем: 1 блюдо = 1 чанк, 1 раздел политики = 1 чанк. Тексты короткие, дробить нечего."
+    },
+    {
+      "parameters": {
+        "chunkSize": 4000
+      },
+      "name": "Без разбиения",
+      "type": "@n8n/n8n-nodes-langchain.textSplitterCharacterTextSplitter",
+      "typeVersion": 1,
+      "position": [
+        1616,
+        800
+      ],
+      "id": "b9275c64-a168-42a7-ba7f-bcc34052316f",
+      "notes": "Формально требуется под-нода сплиттера. Размер заведомо больше самого длинного чанка, поэтому фактического разбиения не происходит."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE kb_chunks SET indexed_at = now(), indexed_model = 'text-embedding-bge-m3', indexed_dim = 1024 WHERE indexed_at IS NULL;",
+        "options": {}
+      },
+      "name": "4. Postgres — отметить индексацию",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2144,
+        432
+      ],
+      "id": "be1eff53-14f0-415c-93ff-d61a6c8bd14d",
+      "credentials": {},
+      "notes": "Отметка, что база проиндексирована и КАКОЙ моделью. Поля qdrant_point_id в схеме нет (решение Dennis 18.08): штатная нода Qdrant не возвращает id созданных точек, а идемпотентность обеспечивает content_hash + полная переиндексация."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT count(*) AS chunks, count(*) FILTER (WHERE indexed_at IS NULL) AS not_indexed, min(indexed_model) AS model, min(indexed_dim) AS dim FROM kb_chunks;",
+        "options": {}
+      },
+      "name": "5. Проверка",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2368,
+        432
+      ],
+      "id": "585935a5-cb73-4b7f-a2fc-5498f0b6e732",
+      "credentials": {},
+      "notes": "Ожидается: chunks = 41, not_indexed = 0, model = text-embedding-bge-m3, dim = 1024. Сверить с числом точек в Qdrant: GET /collections/basilik_kb → points_count = 41."
+    },
+    {
+      "parameters": {
+        "content": "## Перед запуском\n\n1. Проверить, что сервисы на Mac живы **и LM Studio запущен**:\n```\ncurl -s http://YOUR_LOCAL_HOST:6333/healthz\ncurl -s http://YOUR_LOCAL_HOST:1234/v1/models\n```\nМодель `text-embedding-bge-m3` в списке может не показываться — она поднимается\nпо первому запросу. Главное, чтобы сам LM Studio был запущен.\n\n**Защита от дублей встроена (правка 19.08).** Узел 1 берёт только чанки с пустым\n`indexed_at`, узел 4 отмечает только их же. Повторный запуск больше НЕ заливает базу\nвторой раз — он честно скажет «индексировать нечего».\n\n**ПЕРЕиндексация** (текст чанков изменился или сменилась модель) — три шага:\n```\ncurl -X DELETE http://YOUR_LOCAL_HOST:6333/collections/basilik_kb -H \"api-key: $QDRANT_KEY\"\ncurl -X PUT http://YOUR_LOCAL_HOST:6333/collections/basilik_kb \\\n  -H \"api-key: $QDRANT_KEY\" -H \"Content-Type: application/json\" \\\n  -d '{\"vectors\":{\"size\":1024,\"distance\":\"Cosine\"}}'\n```\nи в базе: `update kb_chunks set indexed_at = null, indexed_model = null, indexed_dim = null;`\n\n**Контроль после прогона:** точек в `basilik_kb` должно быть ровно столько же,\nсколько строк в `kb_chunks` — сейчас 41. Больше — значит залито дважды.\n\n**Размерность менять нельзя** без пересоздания коллекции и полной переиндексации.",
+        "height": 420,
+        "width": 460,
+        "color": 4
+      },
+      "name": "ПЕРЕД ЗАПУСКОМ",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1216,
+        592
+      ],
+      "id": "6462ea4a-2a89-4962-aefc-f0db053cff81"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "0. Запуск вручную": {
+      "main": [
+        [
+          {
+            "node": "1. Postgres — забрать чанки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Postgres — забрать чанки": {
+      "main": [
+        [
+          {
+            "node": "2. Подготовить документы",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Подготовить документы": {
+      "main": [
+        [
+          {
+            "node": "3. Qdrant — вставка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Qdrant — вставка": {
+      "main": [
+        [
+          {
+            "node": "4. Postgres — отметить индексацию",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. Postgres — отметить индексацию": {
+      "main": [
+        [
+          {
+            "node": "5. Проверка",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings — bge-m3 (LM Studio)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "3. Qdrant — вставка",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Загрузчик документов": {
+      "ai_document": [
+        [
+          {
+            "node": "3. Qdrant — вставка",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Без разбиения": {
+      "ai_textSplitter": [
+        [
+          {
+            "node": "Загрузчик документов",
+            "type": "ai_textSplitter",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "staticData": null
+}

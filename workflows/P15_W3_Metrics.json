@@ -1,0 +1,240 @@
+{
+  "name": "Проект 15 — W3: метрики за час (Базилик)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "w301",
+      "name": "0. Раз в час",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -688,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://YOUR_LOCAL_HOST:6333/healthz",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "w302",
+      "name": "1. Qdrant жив?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -464,
+        304
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "http://YOUR_LOCAL_HOST:1234/v1/models",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "w303",
+      "name": "2. LM Studio жив?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -240,
+        304
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT count(*) AS ops, count(*) FILTER (WHERE status = 'error') AS errors, count(*) FILTER (WHERE status = 'escalated') AS escalated, count(*) FILTER (WHERE cache_hit) AS from_cache, round(avg(latency_ms)) AS avg_latency_ms, max(latency_ms) AS max_latency_ms, round(avg(retrieval_top_score)::numeric, 3) AS avg_top_score, (SELECT count(*) FROM escalations WHERE status = 'open' AND coalesce(operator_note,'') NOT LIKE 'техническая:%') AS open_escalations, (SELECT count(*) FROM escalations WHERE status = 'open' AND created_at >= now() - interval '1 hour') AS new_escalations_1h, (SELECT count(*) FROM bookings WHERE booking_date = current_date AND status IN ('pending','reminded_2h','reminded_24h')) AS unconfirmed_today , (SELECT value FROM restaurant_config WHERE key = 'operator_chat_id') AS operator_chat_id FROM operation_log WHERE created_at >= now() - interval '1 hour';",
+        "options": {}
+      },
+      "id": "w304",
+      "name": "3. Postgres — метрики за час",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -16,
+        304
+      ],
+      "alwaysOutputData": true,
+      "credentials": {},
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// W3 отвечает на вопрос «система отвечает ХОРОШО?».\n// На вопрос «сервисы ЖИВЫ?» отвечает отдельный граф — «Сторож локального стека».\n// Проверки Qdrant и LM Studio нужны здесь не для тревоги, а чтобы не принять тишину\n// сломанного сервиса за хорошие метрики: они помечают цифры недостоверными.\n// Тревогу о смерти сервиса поднимает сторож — иначе администратор получит\n// два сообщения об одном и том же и перестанет читать оба.\nconst alive = (name) => {\n  try {\n    const j = $(name).item.json || {};\n    return !(j.error || j.__error);\n  } catch (e) { return false; }\n};\n\nconst qdrantOk = alive('1. Qdrant жив?');\nconst lmsOk    = alive('2. LM Studio жив?');\n\nlet m = {};\nlet pgOk = true;\ntry { m = $('3. Postgres — метрики за час').item.json || {}; if (m.error) pgOk = false; }\ncatch (e) { pgOk = false; }\n\n// Пороги откалиброваны по факту, а не на глаз. Замер 21.08 по 77 обращениям за 12 часов:\n// медиана 8,8 с, p95 38,5 с, максимум 54,3 с — столько стоит цепочка «роутер → агент →\n// поиск по базе → валидатор» на локальных моделях. Прежний порог «максимум дольше 30 с»\n// звенел бы каждый час на исправной системе, а ложная тревога хуже её отсутствия.\nconst MIN_OPS     = 5;      // на трёх обращениях статистики нет — про качество молчим\nconst ERR_MAX     = 3;      // ошибок за час\nconst AVG_LAT_MAX = 30000;  // средний ответ вдвое дольше обычного (обычно около 13 с)\nconst NEW_ESC_MAX = 5;      // новых неразобранных эскалаций за час — очередь к человеку растёт\n\nconst ops = Number(m.ops || 0);\nconst enoughData = ops >= MIN_OPS;\nconst problems = [];\n\nif (!pgOk) problems.push('Postgres недоступен — метрики за час снять не удалось');\n\nif (pgOk && enoughData) {\n  if (Number(m.errors || 0) > ERR_MAX)\n    problems.push(`ошибок за час: ${m.errors} (порог ${ERR_MAX})`);\n  if (Number(m.avg_latency_ms || 0) > AVG_LAT_MAX)\n    problems.push(`средний ответ ${(Number(m.avg_latency_ms) / 1000).toFixed(1)} с — вдвое дольше обычного`);\n}\n\n// Очередь к человеку смотрим всегда: она не зависит от того, сколько было обращений.\n// Считаем НОВЫЕ за час, а не весь накопленный список: в накопленном лежат эскалации\n// зачётных прогонов, их разбирают вручную, и по ним тревожить каждый час бессмысленно.\nif (pgOk && Number(m.new_escalations_1h || 0) > NEW_ESC_MAX)\n  problems.push(`новых эскалаций за час: ${m.new_escalations_1h} — очередь к человеку растёт`);\n\nconst dead = [!qdrantOk ? 'Qdrant' : null, !lmsOk ? 'LM Studio' : null].filter(Boolean);\nconst stale = dead.length\n  ? `\\n\\n⚠️ _Не отвечают: ${dead.join(', ')} — цифры за час считайте недостоверными. Подробности пришлёт сторож._`\n  : '';\n\nconst text =\n  `📊 *W3 · метрики за час: требуется внимание*\\n\\n— ${problems.join('\\n— ')}\\n\\n` +\n  `_За последний час:_ обращений ${m.ops ?? '—'}, ошибок ${m.errors ?? '—'}, ` +\n  `эскалаций ${m.escalated ?? '—'}, из кэша ${m.from_cache ?? '—'}, ` +\n  `средняя задержка ${m.avg_latency_ms ?? '—'} мс, самая долгая ${m.max_latency_ms ?? '—'} мс.\\n` +\n  `Не разобрано эскалаций всего: ${m.open_escalations ?? '—'}. ` +\n  `Не подтвердили визит сегодня: ${m.unconfirmed_today ?? '—'}.` + stale;\n\nreturn [{ json: { ...m, qdrant_ok: qdrantOk, lmstudio_ok: lmsOk, postgres_ok: pgOk,\n                  enough_data: enoughData,\n                  alert: problems.length > 0, problems, alert_text: text } }];\n"
+      },
+      "id": "w305",
+      "name": "4. Собрать состояние",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "has-problem",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.alert }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "w306",
+      "name": "5. IF есть проблемы?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        432,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.operator_chat_id }}",
+        "text": "=🧑‍🍳 АДМИНИСТРАТОРУ · метрики W3\n────────────\n{{ $json.alert_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "w307",
+      "name": "6. Telegram — тревога",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        208
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "content": "## W3 — метрики за час\n\n**Чем отличается от сторожа.** Сторож локального стека отвечает на вопрос «сервисы живы?» и приходит ДО того, как гость остался без ответа. W3 отвечает на другой вопрос — «система отвечает хорошо?»: ошибки, средняя задержка, растущая очередь к человеку. Сервис может быть жив, а качество падать — здоровье этого не увидит.\n\n**Повод из жизни проекта.** 14.08 в Модуле 14 Qdrant умер за ночь, и ветка поиска молча отвечала «нет такой информации» на вопрос, ответ на который в базе был. Тихий отказ хуже громкого.\n\n**Пишет только когда есть проблема.** Граф, который каждый час рапортует «всё хорошо», перестают читать на третий день — и пропускают настоящую тревогу.\n\n**Пороги — по замеру, не на глаз.** 21.08, 77 обращений за 12 часов: медиана 8,8 с, p95 38,5 с. Поэтому тревога идёт по СРЕДНЕЙ задержке за час и только если обращений было не меньше пяти: на трёх обращениях статистики нет.\n\n**Проверки не роняют сам граф:** у HTTP-узлов и у запроса к базе включено «продолжать при ошибке», иначе упавший сервис заодно убивал бы того, кто должен о нём сообщить.",
+        "height": 340,
+        "width": 540
+      },
+      "id": "w308",
+      "name": "ЗАЧЕМ СТОРОЖ",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -704,
+        -80
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "0. Раз в час": {
+      "main": [
+        [
+          {
+            "node": "1. Qdrant жив?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Qdrant жив?": {
+      "main": [
+        [
+          {
+            "node": "2. LM Studio жив?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. LM Studio жив?": {
+      "main": [
+        [
+          {
+            "node": "3. Postgres — метрики за час",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Postgres — метрики за час": {
+      "main": [
+        [
+          {
+            "node": "4. Собрать состояние",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. Собрать состояние": {
+      "main": [
+        [
+          {
+            "node": "5. IF есть проблемы?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5. IF есть проблемы?": {
+      "main": [
+        [
+          {
+            "node": "6. Telegram — тревога",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "Europe/Berlin"
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "staticData": null
+}

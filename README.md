@@ -1,0 +1,102 @@
+# Restaurant-Assistent – lokal, Multi-Agent, DSGVO-first
+
+**[DE](#deutsch) · [EN](#english)** · Fallstudie auf [denpilot.de](https://denpilot.de/#projekt-restaurant)
+
+> Bereinigte Kopien: ohne Zugangsdaten, IDs und Kontaktdaten. Fallstudien mit fiktiven Unternehmen, keine Kundendaten.
+
+## Deutsch
+
+### Aufgabe
+Ein Restaurant in Berlin verbringt täglich 3–5 Stunden mit Nachrichten: Reservierungen, Fragen zu Gerichten und Allergenen, Bestätigungen. Fehler bei Allergenen sind ein Gesundheitsrisiko, verpasste Bestätigungen kosten Tische. Angaben zu Allergien sind Gesundheitsdaten nach Art. 9 Abs. 1 DSGVO.
+
+### Architektur
+7 n8n-Workflows (≈ 150 Knoten): Dialog per Text und Sprache, Reservierungsregeln im Code, Erinnerung 2 h vorher, nächtliche Qualitätsbewertung, Monitoring. Diagramm: [`docs/architecture.md`](docs/architecture.md).
+
+Stack: n8n · Postgres · Qdrant (bge-m3) · lokale Modelle in LM Studio · eigener Router Qwen3-4B + LoRA · whisper.cpp · Piper.
+
+### Wer macht was
+| KI | Code | Mensch |
+|---|---|---|
+| Anliegen erkennen, Antworten formulieren, Gerichte nach Bedeutung finden | Öffnungszeiten, Vorlauf, Anzahlung, Datumslogik, Prüfung jeder Antwort | Beschwerden, Sonderwünsche, unklare Allergiefragen, unbestätigte Reservierungen |
+
+### Zuverlässigkeit
+- Der Validator prüft jede Antwort; beim zweiten Fehlschlag übernimmt ein Mensch.
+- Erinnerung 2 h vorher: keine Reaktion ist keine Zusage – nach 30 min wird das Team informiert.
+- Allergiefragen per Sprache werden nicht automatisch beantwortet: Rückfrage in Textform oder Mensch.
+- Cache nur für freigegebene Antworten; er verfällt, sobald sich die Speisekarte ändert.
+- Fehler beim Speichern einer Reservierung brechen laut ab – nie „gesagt, aber nicht gebucht“.
+
+### DSGVO / KI-Verordnung
+Modelle, Datenbank und Vektorsuche laufen auf eigener Hardware; Name, Telefon und E-Mail werden vor jedem Modellaufruf maskiert. Hinweise nach Art. 13 DSGVO und Art. 50 KI-Verordnung erzeugt der Code, nicht das Modell.
+
+### Ergebnisse
+- Router-Genauigkeit **86,8 %** (46 von 53 Dialogen, gemessen)
+- Routing **0,25 s** statt 3,89 s; Antwort 6,8 s statt 10,5 s (gemessen)
+- Nächtliche Bewertung 8,27 / 10 (16 Dialoge)
+- Betrieb ≈ 550 €/Jahr (Modellrechnung); lokal rund 50 €/Monat teurer als Cloud – bewusst.
+
+### Demo starten
+1. n8n (self-hosted, aktuelle 1.x/2.x) starten.
+2. **Neuen, leeren** Workflow anlegen → Menü **⋯ → Import from File** → JSON aus `workflows/` wählen.
+   Wichtig: Import in einen bereits gefüllten Workflow fügt Knoten hinzu, statt ihn zu ersetzen.
+3. Zugangsdaten (Credentials) in n8n anlegen und an den markierten Knoten auswählen – im JSON sind sie bewusst leer.
+4. Platzhalter ersetzen (siehe `.env.example`): `YOUR_LOCAL_HOST`, `YOUR_CHAT_ID`, `YOUR_SHEET_ID` usw.
+5. Erst testen, dann aktivieren. Alle Workflows sind im Export **inaktiv**.
+6. Datenbank: `createdb basilik` und `psql -d basilik -f db/01_schema.sql -f db/02_answer_cache.sql`.
+7. Lokale Dienste: LM Studio (Port 1234) mit Router-, Agenten- und Embedding-Modell (bge-m3), Qdrant (6333), Sprachdienst (8088). Danach `P15_W5_Ingestion` einmal manuell ausführen.
+
+### Grenzen
+- Der feinabgestimmte LoRA-Router und der Sprachdienst (whisper.cpp/Piper-Wrapper) sind nicht Teil dieses Repos.
+- Die Genauigkeit 86,8 % stammt aus einer Markierung mit sichtbarer Vorhersage; eine blinde Nachmarkierung steht aus.
+- Die DPIA und die Präsentation sind nicht enthalten.
+
+---
+
+## English
+
+### Task
+A Berlin restaurant spends 3–5 hours a day on messages: bookings, questions about dishes and allergens, confirmations. Allergen mistakes are a health risk; missed confirmations cost tables. Allergy information is health data under Art. 9(1) GDPR.
+
+### Architecture
+7 n8n workflows (≈ 150 nodes): text and voice dialogue, booking rules in code, reminder 2 h before, nightly quality evaluation, monitoring. Diagram: [`docs/architecture.md`](docs/architecture.md).
+
+Stack: n8n · Postgres · Qdrant (bge-m3) · local models in LM Studio · custom router Qwen3-4B + LoRA · whisper.cpp · Piper.
+
+### Who does what
+| AI | Code | Human |
+|---|---|---|
+| Detect intent, write answers, find dishes by meaning | Opening hours, lead time, deposit, date logic, checking every answer | Complaints, special requests, unclear allergy questions, unconfirmed bookings |
+
+### Reliability
+- The validator checks every answer; after the second failure a human takes over.
+- Reminder 2 h before: no reaction is not a confirmation – the team is notified after 30 min.
+- Allergy questions by voice are never answered automatically: text follow-up or a human.
+- Cache only for approved answers; it expires as soon as the menu changes.
+- Failures when saving a booking fail loudly – never “said, but not booked”.
+
+### GDPR / AI Act
+Models, database and vector search run on own hardware; name, phone and e-mail are masked before every model call. Notices under Art. 13 GDPR and Art. 50 AI Act are generated by code, not by the model.
+
+### Results
+- Router accuracy **86.8 %** (46 of 53 dialogues, measured)
+- Routing **0.25 s** instead of 3.89 s; answer 6.8 s instead of 10.5 s (measured)
+- Nightly evaluation 8.27 / 10 (16 dialogues)
+- Running cost ≈ €550/year (model estimate); local is approx. €50/month more than cloud – deliberately.
+
+### Run the demo
+1. Start n8n (self-hosted, current 1.x/2.x).
+2. Create a **new, empty** workflow → menu **⋯ → Import from File** → pick a JSON from `workflows/`.
+   Note: importing into a non-empty workflow adds nodes instead of replacing them.
+3. Create the credentials in n8n and select them on the marked nodes – they are deliberately empty in the JSON.
+4. Replace the placeholders (see `.env.example`): `YOUR_LOCAL_HOST`, `YOUR_CHAT_ID`, `YOUR_SHEET_ID`, etc.
+5. Test first, then activate. All workflows are exported **inactive**.
+6. Database: `createdb basilik` and `psql -d basilik -f db/01_schema.sql -f db/02_answer_cache.sql`.
+7. Local services: LM Studio (port 1234) with router, agent and embedding model (bge-m3), Qdrant (6333), voice service (8088). Then run `P15_W5_Ingestion` once manually.
+
+### Limitations
+- The fine-tuned LoRA router and the voice service (whisper.cpp/Piper wrapper) are not part of this repo.
+- The 86.8 % accuracy comes from labelling with the prediction visible; a blind re-labelling is pending.
+- The DPIA and the presentation are not included.
+
+---
+Cleaned copies: no credentials, IDs or contact details. Case studies with fictitious companies, no customer data. · Licence: MIT · [LinkedIn](https://www.linkedin.com/in/denys-kopyl-ai-automation/)

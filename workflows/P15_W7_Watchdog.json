@@ -1,0 +1,422 @@
+{
+  "name": "Проект 15 — Сторож локального стека (Базилик)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "wd00",
+      "name": "0. Каждые 10 минут",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -880,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://YOUR_LOCAL_HOST:8088/health",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "wd01",
+      "name": "1a. Голос — whisper и Piper (8088)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -656,
+        304
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "🔴 Проверки сделаны ОТДЕЛЬНЫМИ HTTP-узлами, а не кодом: в Code-узле этого n8n $helpers недоступен, все вызовы падают в catch, и сторож рапортует «лежат все», когда лежит один (урок Модуля 14, прогон 987). Ложная тревога хуже отсутствия тревоги."
+    },
+    {
+      "parameters": {
+        "url": "http://YOUR_LOCAL_HOST:6333/healthz",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "wd02",
+      "name": "1b. Qdrant — векторный поиск (6333)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -464,
+        304
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Отвечает простым текстом healthz check passed, а не JSON — поэтому в узле 2 проверяется вхождение подстроки, а не поле."
+    },
+    {
+      "parameters": {
+        "url": "http://YOUR_LOCAL_HOST:1234/api/v0/models",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "wd03",
+      "name": "1c. LM Studio — модели в памяти (1234)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -256,
+        304
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "🔴 Берём /api/v0/models, а не /v1/models: второй перечисляет все установленные модели, а первый показывает state: loaded / not-loaded. Именно выгрузка моделей из памяти положила ночной Eval 20.08: сервис был жив, а судьи в памяти не было."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT 1 AS ok;",
+        "options": {}
+      },
+      "id": "wd04",
+      "name": "1d. Postgres — база жива?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -64,
+        304
+      ],
+      "alwaysOutputData": true,
+      "credentials": {},
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Каждая проверка читается у своего узла по имени. Если узел упал, в элементе лежит\n// ошибка, а не ответ — это и есть признак недоступности сервиса.\nconst get = (name) => { try { return $(name).item.json; } catch (e) { return null; } };\n\nconst voice = get('1a. Голос — whisper и Piper (8088)');\nconst qdrant = get('1b. Qdrant — векторный поиск (6333)');\nconst lm     = get('1c. LM Studio — модели в памяти (1234)');\nconst pg     = get('1d. Postgres — база жива?');\n\nconst failed = [];\n\n// 1. Голосовой сервис: распознавание и озвучка живут в одном процессе.\nif (!(voice && voice.status === 'ok' && voice.whisper === 'ok'))\n  failed.push('голос (whisper + Piper, 8088)');\n\n// 2. Qdrant отвечает текстом, не JSON.\nif (!JSON.stringify(qdrant || {}).includes('passed'))\n  failed.push('Qdrant — векторный поиск (6333)');\n\n// 3. LM Studio: мало чтобы сервис отвечал — нужные модели должны быть В ПАМЯТИ.\nconst NEEDED = { 'm15-router-qwen3-4b-lora': 'роутер', 'gemma-4-12b-it-mlx': 'агенты и валидатор',\n                 'text-embedding-bge-m3': 'поиск по меню', 'meta/muse-glimmer': 'судья Eval' };\nlet loaded = [];\nif (lm && Array.isArray(lm.data)) {\n  loaded = lm.data.filter((m) => m.state === 'loaded').map((m) => m.id);\n  const missing = Object.keys(NEEDED).filter((id) => !loaded.includes(id));\n  if (missing.length)\n    failed.push('модели выгружены из памяти: ' + missing.map((id) => `${id} (${NEEDED[id]})`).join(', '));\n} else {\n  failed.push('LM Studio — языковые модели (1234)');\n}\n\n// 4. База.\nif (!(pg && (pg.ok === 1 || pg.ok === '1')))\n  failed.push('PostgreSQL — база броней и журнала');\n\nreturn [{ json: { failed, ok: failed.length === 0, loaded_models: loaded,\n                  // Состав сбоев, а не их количество — ключ для дедупликации.\n                  state_key: failed.slice().sort().join(' | ') || 'OK' } }];\n"
+      },
+      "id": "wd05",
+      "name": "2. Свести результат проверок",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        144,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT coalesce((SELECT value FROM restaurant_config WHERE key = 'watchdog_last_state'), 'OK') AS last_state, (SELECT value FROM restaurant_config WHERE key = 'operator_chat_id') AS operator_chat_id;",
+        "options": {}
+      },
+      "id": "wd06",
+      "name": "2b. Postgres — прошлое состояние и адрес оператора",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        352,
+        304
+      ],
+      "alwaysOutputData": true,
+      "credentials": {},
+      "onError": "continueRegularOutput",
+      "notes": "Адрес администратора берётся из restaurant_config, а не зашивается числом и не читается из $env ($env на этом инстансе запрещён)."
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst cur = $('2. Свести результат проверок').item.json;\nconst db = $input.first().json || {};\nconst prev = String(db.last_state || 'OK');\nconst chat = db.operator_chat_id || null;\nconst changed = cur.state_key !== prev;\n\nlet text = '';\nif (changed && !cur.ok) {\n  text = '🚨 Сторож «Базилика»: есть проблема\\n────────────\\n\\n'\n       + 'Не отвечает или работает неверно:\\n— ' + cur.failed.join('\\n— ')\n       + '\\n\\nЧто это значит для гостей: '\n       + (cur.failed.some((f) => f.includes('PostgreSQL')) ? 'бот не сможет ни ответить, ни записать бронь.'\n          : cur.failed.some((f) => f.includes('модели') || f.includes('LM Studio')) ? 'бот перестанет отвечать по существу или начнёт долго думать.'\n          : cur.failed.some((f) => f.includes('Qdrant')) ? 'ответы по меню и аллергенам потеряют опору на базу знаний.'\n          : 'голосовые сообщения не будут распознаваться и озвучиваться, текст работает.')\n       + '\\n\\nПроверка каждые 10 минут. Следующее сообщение придёт, когда состав сбоев изменится.';\n} else if (changed && cur.ok) {\n  text = '✅ Сторож «Базилика»: всё восстановлено\\n────────────\\n\\n'\n       + 'Было: ' + prev + '\\nСейчас все четыре службы отвечают, нужные модели в памяти.';\n}\n\nreturn [{ json: { ...cur, prev_state: prev, changed, operator_chat_id: chat, alert_text: text } }];\n"
+      },
+      "id": "wd07",
+      "name": "3. Дедупликация по составу сбоев",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        544,
+        304
+      ],
+      "notes": "Сообщение уходит не при каждом сбое, а при ИЗМЕНЕНИИ СОСТАВА лежащих сервисов. Лежит Qdrant десять проверок подряд — одно сообщение, а не десять. Восстановление тоже событие: о нём сообщаем один раз."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO restaurant_config (key, value, note) VALUES ('watchdog_last_state', $1, 'состав лежащих служб на момент последней проверки сторожа') ON CONFLICT (key) DO UPDATE SET value = excluded.value RETURNING key, value;",
+        "options": {
+          "queryReplacement": "={{ [ $json.state_key ] }}"
+        }
+      },
+      "id": "wd08",
+      "name": "3b. Postgres — запомнить состояние",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        752,
+        304
+      ],
+      "alwaysOutputData": true,
+      "credentials": {},
+      "onError": "continueRegularOutput",
+      "notes": "Состояние хранится в той же таблице настроек, что и остальные параметры ресторана — новое хранилище не заводим."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "changed",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('3. Дедупликация по составу сбоев').item.json.changed === true }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "wd09",
+      "name": "4. IF состав сбоев изменился?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        944,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('3. Дедупликация по составу сбоев').item.json.operator_chat_id }}",
+        "text": "={{ $('3. Дедупликация по составу сбоев').item.json.alert_text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "wd10",
+      "name": "5. Telegram — тревога администратору",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1152,
+        224
+      ],
+      "credentials": {},
+      "onError": "continueRegularOutput",
+      "notes": "Текст человеку, а не машине: без JSON и стеков. parse_mode не задаём — разметка Telegram ломается о подчёркивания в именах моделей (урок 20.08)."
+    },
+    {
+      "parameters": {},
+      "id": "wd11",
+      "name": "E0. Ошибка в любом воркфлоу",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst e = $input.first().json || {};\nconst wf = e.workflow || {};\nconst ex = e.execution || {};\nconst node = ex.lastNodeExecuted || 'неизвестен';\nconst msg = String(ex.error?.message || e.message || 'без текста').split('\\n')[0].slice(0, 300);\n\nconst text = '⚠️ Прогон упал\\n────────────\\n\\n'\n  + 'Граф: ' + (wf.name || 'неизвестен') + '\\n'\n  + 'Узел: ' + node + '\\n'\n  + 'Ошибка: ' + msg + '\\n'\n  + (ex.id ? 'Выполнение № ' + ex.id + '\\n' : '')\n  + (ex.url ? ex.url + '\\n' : '')\n  + '\\nГость мог не получить ответ — проверьте переписку.';\n\nreturn [{ json: { text } }];\n"
+      },
+      "id": "wd12",
+      "name": "E1. Текст об ошибке для человека",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -624,
+        640
+      ],
+      "notes": "За 20.08 MAIN падал многократно, и каждый раз мы узнавали об этом от человека, а не от системы."
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "wd13",
+      "name": "E2. Telegram — сообщить об ошибке",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -384,
+        640
+      ],
+      "credentials": {},
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## Сторож локального стека\n\n**Чем отличается от W3.** W3 смотрит на **метрики** — ошибки, задержки, долю эскалаций. Он узнает о беде ПОСЛЕ того, как гость не получил ответ.\n\nЭтот граф смотрит на **здоровье служб**, каждые 10 минут, ДО того как пришёл гость.\n\n**Пять проверок:** голосовой сервис (8088) · Qdrant (6333) · LM Studio (1234) · PostgreSQL · и отдельно — **находятся ли нужные модели в памяти**. Последнее — не теория: 20.08 ночной Eval упал именно потому, что LM Studio был жив, а судья выгружен из памяти.\n\n**Дедупликация по составу сбоев.** Сообщение уходит при изменении состава, а не каждые 10 минут. На повторяющуюся тревогу перестают реагировать.\n\n🔴 **Проверки — отдельными HTTP-узлами, не кодом.** В Code-узле $helpers недоступен, все вызовы падают в catch — и сторож рапортует «лежат все», когда лежит один (урок Модуля 14).\n\n**Вторая половина графа** — Error Trigger: когда падает любой воркфлоу, администратор получает человеческое сообщение: какой граф, какой узел, что случилось.",
+        "height": 320,
+        "width": 620
+      },
+      "id": "wd14",
+      "name": "ЗАЧЕМ СТОРОЖ И ЧЕМ ОН ОТЛИЧАЕТСЯ ОТ W3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        -80
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "0. Каждые 10 минут": {
+      "main": [
+        [
+          {
+            "node": "1a. Голос — whisper и Piper (8088)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1a. Голос — whisper и Piper (8088)": {
+      "main": [
+        [
+          {
+            "node": "1b. Qdrant — векторный поиск (6333)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1b. Qdrant — векторный поиск (6333)": {
+      "main": [
+        [
+          {
+            "node": "1c. LM Studio — модели в памяти (1234)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1c. LM Studio — модели в памяти (1234)": {
+      "main": [
+        [
+          {
+            "node": "1d. Postgres — база жива?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1d. Postgres — база жива?": {
+      "main": [
+        [
+          {
+            "node": "2. Свести результат проверок",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Свести результат проверок": {
+      "main": [
+        [
+          {
+            "node": "2b. Postgres — прошлое состояние и адрес оператора",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2b. Postgres — прошлое состояние и адрес оператора": {
+      "main": [
+        [
+          {
+            "node": "3. Дедупликация по составу сбоев",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Дедупликация по составу сбоев": {
+      "main": [
+        [
+          {
+            "node": "3b. Postgres — запомнить состояние",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3b. Postgres — запомнить состояние": {
+      "main": [
+        [
+          {
+            "node": "4. IF состав сбоев изменился?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. IF состав сбоев изменился?": {
+      "main": [
+        [
+          {
+            "node": "5. Telegram — тревога администратору",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "E0. Ошибка в любом воркфлоу": {
+      "main": [
+        [
+          {
+            "node": "E1. Текст об ошибке для человека",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "E1. Текст об ошибке для человека": {
+      "main": [
+        [
+          {
+            "node": "E2. Telegram — сообщить об ошибке",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "Europe/Berlin"
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "staticData": null
+}
